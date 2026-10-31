@@ -199,6 +199,14 @@ async function createMessage(env, request) {
   return json({ message }, 201);
 }
 
+function ttsCacheKey(requestUrl, text, voice, speed) {
+  const key = new URL('/api/tts-cache', requestUrl);
+  key.searchParams.set('text', text);
+  key.searchParams.set('voice', voice);
+  key.searchParams.set('speed', String(speed));
+  return new Request(key.toString(), { method: 'GET' });
+}
+
 async function synthesizeSpeech(request, env) {
   if (!env.QWEN_TTS_API_KEY) return json({ error: 'tts_unavailable' }, 503);
 
@@ -220,6 +228,23 @@ async function synthesizeSpeech(request, env) {
     : 1;
   // 百炼用语速偏移量（-500~500），前端传的是倍速，这里换算。
   const rate = Math.round((speed - 1) * 500);
+
+  // 部署在离百炼很远的边缘时，一次合成本身要十几到几十秒。
+  // 同样的「文本+音色+语速」结果不会变，放进边缘缓存后，第二次起就是秒回。
+  const cacheKey = ttsCacheKey(request.url, text, voice, speed);
+  const edgeCache = typeof caches === 'undefined' ? null : caches.default;
+  const cached = edgeCache ? await edgeCache.match(cacheKey) : undefined;
+  if (cached) {
+    return new Response(cached.body, {
+      status: 200,
+      headers: {
+        ...CORS_HEADERS,
+        'cache-control': 'no-store',
+        'content-type': cached.headers.get('content-type') ?? 'audio/wav',
+        'x-tts-cache': 'hit',
+      },
+    });
+  }
 
   let synthesis;
   try {
@@ -281,13 +306,40 @@ async function synthesizeSpeech(request, env) {
     );
   }
 
-  return new Response(audio.body, {
+  // 整段读进内存再回：直通上游 body 的流式响应经过边缘时会慢到几 KB/s，
+  // 而一段提醒语音只有几十 KB，固定长度返回反而更快也更稳。
+  let audioBytes;
+  const audioType = audio.headers.get('content-type') ?? 'audio/wav';
+  try {
+    audioBytes = await audio.arrayBuffer();
+  } catch {
+    return json({ error: 'tts_failed', stage: 'download_body' }, 502);
+  }
+
+  if (edgeCache) {
+    try {
+      await edgeCache.put(
+        cacheKey,
+        new Response(audioBytes, {
+          status: 200,
+          headers: {
+            'content-type': audioType,
+            'cache-control': 'public, max-age=2592000',
+          },
+        }),
+      );
+    } catch {
+      // 缓存写失败不影响这次播放。
+    }
+  }
+
+  return new Response(audioBytes, {
     status: 200,
     headers: {
       ...CORS_HEADERS,
       'cache-control': 'no-store',
-      'content-type':
-        audio.headers.get('content-type') ?? 'audio/wav',
+      'content-type': audioType,
+      'x-tts-cache': 'miss',
     },
   });
 }

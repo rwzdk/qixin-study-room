@@ -2,6 +2,12 @@ name = "qingyan-chat"
 main = "worker.js"
 compatibility_date = "2026-10-01"
 
+# 百炼 TTS 与音频都在国内。用户的请求常落在美国边缘（实测 LAX），
+# 每次合成都要横跨太平洋来回取，慢到几十秒。Smart Placement 让 Worker
+# 跑在离上游更近的边缘，把这段往返压掉。
+[placement]
+mode = "smart"
+
 # 运行 `pnpm chat:db:create` 后，把输出的 database_id 填到这里。
 # 本地 `pnpm chat:dev` 可以使用下面的占位值；远程部署前必须替换。
 [[d1_databases]]

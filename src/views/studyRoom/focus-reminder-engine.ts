@@ -9,6 +9,7 @@
  */
 
 import type { FocusReminderPrefs, ReminderSound } from './focus-reminder-prefs';
+import { readVoiceAudio, saveVoiceAudio } from './focus-voice-store';
 
 const FIRED_KEY = 'qingyan-study-room:focus-reminder:fired';
 const FIRE_CLAIM_TTL = 120_000;
@@ -295,7 +296,14 @@ function getSynth(): SpeechSynthesis | null {
 const CLOUD_TTS_URL = (
   (import.meta.env.VITE_TTS_API_URL as string | undefined) ?? ''
 ).trim();
+// Worker 部署在离百炼很远的边缘时，一次合成要十几到几十秒；
+// 音频本身有边缘缓存，第一次慢一点也比直接放弃、退回浏览器音色强。
+const CLOUD_TTS_TIMEOUT = 30_000;
+// 这条链路会整条连接被重置，单次失败很可能下次就通：退避后重试一次。
+const TTS_ATTEMPTS = 2;
+const TTS_RETRY_DELAYS = [500];
 const voiceCache = new Map<string, AudioBuffer>();
+const voicePending = new Map<string, Promise<boolean>>();
 
 /** 是否配置了云端语音服务（没配置就只用浏览器语音）。 */
 export function cloudVoiceAvailable() {
@@ -333,33 +341,82 @@ export async function prepareCloudVoice(
 ): Promise<boolean> {
   const content = text.trim();
   if (!CLOUD_TTS_URL || !content) return false;
-  if (voiceCache.has(voiceCacheKey(content, prefs))) return true;
+  const key = voiceCacheKey(content, prefs);
+  if (voiceCache.has(key)) return true;
+  // 打开面板的预取和点「试听」会同时要同一条语音，合并成一次合成请求。
+  const pending = voicePending.get(key);
+  if (pending) return pending;
   const context = ensureContext();
   if (!context) return false;
+  const job = loadCloudVoice(key, content, prefs, context);
+  voicePending.set(key, job);
   try {
-    const response = await fetch(CLOUD_TTS_URL, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        text: content,
-        voice: prefs.cloudVoice,
-        speed: prefs.rate,
-      }),
-      // 这条链路在部分网络下会抖，给足后台预取时间，但绝不能拖到几十秒。
-      signal:
-        typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal
-          ? AbortSignal.timeout(12000)
-          : undefined,
-    });
-    if (!response.ok) return false;
-    const buffer = await decodeAudio(context, await response.arrayBuffer());
-    if (!buffer) return false;
-    if (voiceCache.size > 12) voiceCache.delete(voiceCache.keys().next().value as string);
-    voiceCache.set(voiceCacheKey(content, prefs), buffer);
-    return true;
-  } catch {
-    return false;
+    return await job;
+  } finally {
+    voicePending.delete(key);
   }
+}
+
+function rememberVoice(key: string, buffer: AudioBuffer): void {
+  if (voiceCache.size > 12) voiceCache.delete(voiceCache.keys().next().value as string);
+  voiceCache.set(key, buffer);
+}
+
+/** 先找本机缓存，再走网络；网络失败会退避重试，成功后落盘供下次离线使用。 */
+async function loadCloudVoice(
+  key: string,
+  content: string,
+  prefs: FocusReminderPrefs,
+  context: AudioContext,
+): Promise<boolean> {
+  const stored = await readVoiceAudio(key);
+  if (stored) {
+    const buffer = await decodeAudio(context, stored);
+    if (buffer) {
+      rememberVoice(key, buffer);
+      return true;
+    }
+  }
+  const downloaded = await downloadVoice(content, prefs);
+  if (!downloaded) return false;
+  // decodeAudioData 会 detach 传入的 ArrayBuffer，先拷一份留给持久缓存。
+  const buffer = await decodeAudio(context, downloaded.slice(0));
+  if (!buffer) return false;
+  rememberVoice(key, buffer);
+  void saveVoiceAudio(key, downloaded);
+  return true;
+}
+
+async function downloadVoice(
+  content: string,
+  prefs: FocusReminderPrefs,
+): Promise<ArrayBuffer | null> {
+  for (let attempt = 0; attempt < TTS_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await fetch(CLOUD_TTS_URL, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          text: content,
+          voice: prefs.cloudVoice,
+          speed: prefs.rate,
+        }),
+        signal:
+          typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal
+            ? AbortSignal.timeout(CLOUD_TTS_TIMEOUT)
+            : undefined,
+      });
+      if (!response.ok) throw new Error('tts_status');
+      const data = await response.arrayBuffer();
+      if (data.byteLength > 0) return data;
+    } catch {
+      // 连接被重置、超时、空响应都走这里，退避后再试一次。
+    }
+    if (attempt < TTS_ATTEMPTS - 1) {
+      await new Promise((resolve) => setTimeout(resolve, TTS_RETRY_DELAYS[attempt] ?? 1500));
+    }
+  }
+  return null;
 }
 
 /** 播放已缓存的云端音色；没有缓存时返回 false 交给调用方回退。 */
@@ -369,13 +426,17 @@ export function playCloudVoice(text: string, prefs: FocusReminderPrefs): boolean
   const context = ensureContext();
   const buffer = voiceCache.get(voiceCacheKey(content, prefs));
   if (!context || !buffer) return false;
-  const source = context.createBufferSource();
-  source.buffer = buffer;
-  const gain = context.createGain();
-  gain.gain.value = Math.min(1, Math.max(0, prefs.volume));
-  source.connect(gain);
-  gain.connect(context.destination);
-  source.start(context.currentTime + 0.02);
+  // 音频上下文可能还没被手势解锁：直接 start 会排进一条不前进的时间轴，
+  // 表现为「返回了 true 却一点声音都没有」。等它真跑起来再播。
+  runWhenRunning(context, () => {
+    const source = context.createBufferSource();
+    source.buffer = buffer;
+    const gain = context.createGain();
+    gain.gain.value = Math.min(1, Math.max(0, prefs.volume));
+    source.connect(gain);
+    gain.connect(context.destination);
+    source.start(context.currentTime + 0.02);
+  });
   return true;
 }
 

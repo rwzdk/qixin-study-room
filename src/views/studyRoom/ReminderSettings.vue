@@ -38,6 +38,8 @@ const notifyState = ref<NotificationPermission | 'unsupported'>(
   notificationPermission(),
 );
 const notifyHint = ref('');
+const previewing = ref(false);
+const previewHint = ref('');
 
 const cloudAvailable = cloudVoiceAvailable();
 
@@ -82,6 +84,10 @@ function toggle() {
   if (open.value) {
     notifyState.value = notificationPermission();
     void refreshVoices();
+    // 打开面板就先把当前云端音色合成好：等点「试听」时通常已经能直接播。
+    if (useCloudVoice.value && prefs.value.text.trim()) {
+      void prepareCloudVoice(prefs.value.text, prefs.value);
+    }
   }
 }
 
@@ -121,12 +127,24 @@ async function toggleNotification() {
 }
 
 async function preview() {
+  if (previewing.value) return;
   playReminderNow(prefs.value.sound);
   if (!prefs.value.useVoice || !prefs.value.text.trim()) return;
   if (useCloudVoice.value) {
     if (playCloudVoice(prefs.value.text, prefs.value)) return;
-    const ready = await prepareCloudVoice(prefs.value.text, prefs.value);
-    if (ready && playCloudVoice(prefs.value.text, prefs.value)) return;
+    // 首次合成要等云端，按钮锁住并说明在做什么，别再悄悄换成浏览器音色。
+    previewing.value = true;
+    previewHint.value = '正在合成云端音色，第一次会慢一些…';
+    try {
+      const ready = await prepareCloudVoice(prefs.value.text, prefs.value);
+      if (ready && playCloudVoice(prefs.value.text, prefs.value)) {
+        previewHint.value = '';
+        return;
+      }
+      previewHint.value = '云端音色暂时合成不出来，这次先用浏览器语音';
+    } finally {
+      previewing.value = false;
+    }
   }
   speakReminder(prefs.value.text, prefs.value);
 }
@@ -310,8 +328,16 @@ onBeforeUnmount(() => {
 
       <div class="reminder-actions">
         <button type="button" class="reminder-ghost" @click="reset">恢复默认</button>
-        <button type="button" class="reminder-primary" @click="preview">试听</button>
+        <button
+          type="button"
+          class="reminder-primary"
+          :disabled="previewing"
+          @click="preview"
+        >
+          {{ previewing ? '合成中…' : '试听' }}
+        </button>
       </div>
+      <p v-if="previewHint" class="reminder-hint">{{ previewHint }}</p>
       <p class="reminder-tip">
         提示音与语音会在页面切到后台时照常响起，音色：{{ voiceLabel }}。
       </p>
